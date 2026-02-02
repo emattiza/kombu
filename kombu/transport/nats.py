@@ -161,6 +161,7 @@ class Channel(virtual.Channel):
         self._nats_client: Client | None = None
         self._js: JetStreamContext | None = None
         self._streams = set()
+        self._subscriptions = {}  # Cache for pull subscriptions
 
         # Evaluate connection
         self.client
@@ -302,14 +303,23 @@ class Channel(virtual.Channel):
         if self._js is None:
             raise RuntimeError("JetStream context not initialized")
 
+        stream_name = self._get_stream_name(queue)
+        consumer_name = self._get_consumer_name(queue)
+        sub_key = f"{stream_name}:{consumer_name}"
+
         try:
-            pull_sub = get_event_loop().run_until_complete(
-                self._js.pull_subscribe(
-                    queue,
-                    self._get_consumer_name(queue),
-                    stream=self._get_stream_name(queue),
+            # Cache subscription for performance - creating a new subscription
+            # on every _get() call adds significant overhead
+            if sub_key not in self._subscriptions:
+                self._subscriptions[sub_key] = get_event_loop().run_until_complete(
+                    self._js.pull_subscribe(
+                        queue,
+                        consumer_name,
+                        stream=stream_name,
+                    )
                 )
-            )
+
+            pull_sub = self._subscriptions[sub_key]
             msg = get_event_loop().run_until_complete(
                 pull_sub.fetch(1, timeout=self.wait_time_seconds)
             )[0]
@@ -327,6 +337,12 @@ class Channel(virtual.Channel):
     def _delete(self, queue, *args, **kwargs):
         """Delete a queue."""
         stream_name = self._get_stream_name(queue)
+        consumer_name = self._get_consumer_name(queue)
+
+        # Clear cached subscription
+        sub_key = f"{stream_name}:{consumer_name}"
+        self._subscriptions.pop(sub_key, None)
+
         if stream_name in self._streams:
             if self._js is None:
                 raise RuntimeError("JetStream context not initialized")
@@ -368,6 +384,11 @@ class Channel(virtual.Channel):
         except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
             return False
 
+    async def _on_reconnect(self):
+        """Called when NATS reconnects - clear cached subscriptions."""
+        logger.info("NATS reconnected, clearing subscription cache")
+        self._subscriptions.clear()
+
     def _open(self):
         """Open a new connection to NATS."""
         if self._nats_client is None:
@@ -381,6 +402,7 @@ class Channel(virtual.Channel):
                     user=self.conninfo.userid,
                     password=self.conninfo.password,
                     connect_timeout=self.connection_wait_time_seconds,
+                    reconnected_cb=self._on_reconnect,
                 )
             )
             self._js = self._nats_client.jetstream()
