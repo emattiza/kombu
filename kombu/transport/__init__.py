@@ -46,6 +46,8 @@ TRANSPORT_ALIASES = {
     'pyro': 'kombu.transport.pyro:Transport',
     'gcpubsub': 'kombu.transport.gcpubsub:Transport',
     'nats': 'kombu.transport.nats:Transport',
+    'nats+jetstream': 'kombu.transport.nats:Transport',
+    'nats+core': 'kombu.transport.nats:Transport',
 }
 
 _transport_cache = {}

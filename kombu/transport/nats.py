@@ -342,15 +342,17 @@ class QoS(virtual.QoS):
 
 
 class Channel(virtual.Channel):
-    """NATS JetStream Channel."""
+    """Base NATS channel: owns the asyncio event loop and NATS client lifecycle.
+
+    Subclasses provide message delivery semantics:
+    - :class:`JetStreamChannel` — JetStream durable streams (at-least-once)
+    - :class:`CoreNATSChannel`  — Core NATS push-subscribe (at-most-once)
+    """
 
     QoS = QoS
-    Message = Message
 
     default_wait_time_seconds = 5
     default_connection_wait_time_seconds = 5
-    default_stream_name_prefix = "STREAM_"
-    default_consumer_name_prefix = "CONSUMER_"
 
     def __init__(self, *args, **kwargs):
         if Client is None:
@@ -379,21 +381,9 @@ class Channel(virtual.Channel):
 
         self._nats_client: Client | None = None
         self._js: JetStreamContext | None = None
-        self._streams = set()
-        self._js_consumers: set = set()
 
         # Evaluate connection
         self.client
-
-    def _get_stream_name(self, queue):
-        """Get the stream name for a queue."""
-        prefix = self.options.get("stream_name_prefix", self.default_stream_name_prefix)
-        return f"{prefix}{queue}"
-
-    def _get_consumer_name(self, queue):
-        """Get the consumer name for a queue."""
-        prefix = self.options.get("consumer_name_prefix", self.default_consumer_name_prefix)
-        return f"{prefix}{queue}"
 
     def _run(self, coro):
         """Submit *coro* to this channel's background event loop and block until done.
@@ -407,6 +397,230 @@ class Channel(virtual.Channel):
             raise RuntimeError("NATS event loop is closed")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result()
+
+    def _open(self):
+        """Open a new connection to NATS."""
+        if self._nats_client is None:
+            self._nats_client = Client()
+            if self._nats_client is None:
+                raise RuntimeError("Failed to create NATS client")
+
+            host = self.conninfo.hostname or DEFAULT_HOST
+            port = self.conninfo.port or DEFAULT_PORT
+            self._run(
+                self._nats_client.connect(
+                    f"nats://{host}:{port}",
+                    user=self.conninfo.userid,
+                    password=self.conninfo.password,
+                    connect_timeout=self.connection_wait_time_seconds,
+                    error_cb=self._on_nats_error,
+                )
+            )
+        return self._nats_client
+
+    @cached_property
+    def client(self):
+        """Get the NATS client."""
+        return self._open()
+
+    @property
+    def options(self):
+        """Get the transport options."""
+        return self.connection.client.transport_options
+
+    @property
+    def conninfo(self):
+        """Get the connection info."""
+        return self.connection.client
+
+    @cached_property
+    def wait_time_seconds(self):
+        """Get the wait time in seconds."""
+        return float(
+            self.options.get("wait_time_seconds", self.default_wait_time_seconds)
+        )
+
+    @cached_property
+    def connection_wait_time_seconds(self):
+        """Get the connection wait time in seconds."""
+        return float(
+            self.options.get(
+                "connection_wait_time_seconds",
+                self.default_connection_wait_time_seconds,
+            )
+        )
+
+    @property
+    def nats_raw_body(self) -> bool:
+        """If ``True``, publish the application payload directly as msg.data.
+
+        Kombu envelope metadata is carried in NATS headers instead.
+        Default ``False`` (backward-compatible envelope-in-body behaviour).
+        """
+        return bool(self.options.get('nats_raw_body', False))
+
+    @property
+    def nats_metadata_header_prefix(self) -> str:
+        """Prefix applied to Kombu metadata header names in raw-body mode.
+
+        Default ``"Kombu-"``.  Must not start with ``"Nats-"`` as that
+        namespace is reserved for NATS/JetStream built-in headers.
+        """
+        prefix = self.options.get('nats_metadata_header_prefix', 'Kombu-')
+        if prefix.lower().startswith('nats-'):
+            logger.warning(
+                "nats_metadata_header_prefix %r begins with 'Nats-', which "
+                "is reserved for NATS/JetStream semantics.  Choose a "
+                "different prefix to avoid conflicts with built-in headers.",
+                prefix,
+            )
+        return prefix
+
+    @property
+    def nats_metadata_header_names(self):
+        """Optional dict of per-field Kombu metadata header name overrides.
+
+        Keys: ``"content_type"``, ``"content_encoding"``, ``"headers"``,
+        ``"properties"``, ``"delivery_info"``.  Only specified keys are
+        overridden; others fall back to :data:`DEFAULT_METADATA_HEADER_NAMES`.
+        """
+        return self.options.get('nats_metadata_header_names', None)
+
+    async def _on_nats_error(self, exc: Exception) -> None:
+        """Async error callback passed to nats-py on connect.
+
+        Drain-timeout errors during ``Channel.close()`` are expected and
+        handled in Python; suppress the default nats-py stderr print for
+        them.  All other errors are forwarded to the Kombu logger.
+        """
+        if isinstance(exc, nats.errors.DrainTimeoutError):
+            logger.debug("NATS drain timed out (suppressed): %s", exc)
+        else:
+            logger.warning("NATS error: %s", exc)
+
+    def close(self):
+        """Close the channel, draining the NATS client then stopping the event loop thread."""
+        if self._nats_client is not None:
+            try:
+                try:
+                    self._run(self._nats_client.drain())
+                except nats.errors.DrainTimeoutError:
+                    logger.debug("NATS drain timed out during channel close; closing anyway")
+                self._run(self._nats_client.close())
+            finally:
+                self._nats_client = None
+                self._js = None
+        if not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+            self._loop.close()
+
+
+class JetStreamChannel(Channel):
+    """NATS JetStream Channel (at-least-once, durable streams)."""
+
+    Message = Message
+
+    #: Set to True so that FanoutExchange.deliver() and queue_bind() activate
+    #: the broadcast path (Core NATS pub/sub — no queue group — one copy per
+    #: subscriber).  JetStream work-queue semantics are kept for regular queues.
+    supports_fanout = True
+
+    default_stream_name_prefix = "STREAM_"
+    default_consumer_name_prefix = "CONSUMER_"
+
+    def __init__(self, *args, **kwargs):
+        self._streams: set = set()
+        self._js_consumers: set = set()
+        # fanout: exchange_name -> asyncio.Queue (fanout inbox per queue)
+        self._fanout_inboxes: dict[str, asyncio.Queue] = {}
+        # fanout: exchange_name -> nats subscription
+        self._fanout_subscriptions: dict[str, object] = {}
+        # fanout: queue_name -> exchange_name
+        self._fanout_queue_to_exchange: dict[str, str] = {}
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _fanout_subject(exchange: str) -> str:
+        """Core NATS subject for fanout exchange — no queue group, all receive."""
+        return f"celery.fanout.{exchange}"
+
+    def _queue_bind(self, exchange, routing_key, pattern, queue):
+        """Register a fanout subscription on Core NATS for *exchange*/*queue*.
+
+        Called by the virtual base when ``supports_fanout = True`` and a queue
+        is bound to a fanout exchange.  Each worker subscribes independently to
+        the fanout subject WITHOUT a queue group so that ALL workers receive
+        every message (broadcast semantics).
+        """
+        if self.typeof(exchange).type != 'fanout':
+            return
+        if exchange not in self._fanout_subscriptions:
+            self._run(self._subscribe_fanout(exchange, queue))
+
+    async def _subscribe_fanout(self, exchange: str, queue: str) -> None:
+        """Open a Core NATS subscription for the fanout exchange."""
+        subject = self._fanout_subject(exchange)
+        inbox: asyncio.Queue = asyncio.Queue(maxsize=MAX_INBOX_SIZE)
+        self._fanout_inboxes[queue] = inbox
+        self._fanout_queue_to_exchange[queue] = exchange
+
+        async def _fanout_handler(msg) -> None:
+            try:
+                inbox.put_nowait(msg)
+            except asyncio.QueueFull:
+                # Head-drop: discard oldest, accept newest.
+                try:
+                    inbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    inbox.put_nowait(msg)
+                except asyncio.QueueFull:
+                    pass
+
+        sub = await self._nats_client.subscribe(subject, cb=_fanout_handler)
+        self._fanout_subscriptions[exchange] = sub
+
+    def get_table(self, exchange):
+        """Return the routing table for *exchange* (required for fanout support)."""
+        try:
+            return self.state.exchanges[exchange].get('table', [])
+        except KeyError:
+            return []
+
+    def _put_fanout(self, exchange, message, routing_key, **kwargs):
+        """Broadcast *message* to ALL workers bound to *exchange*.
+
+        Uses Core NATS ``nc.publish`` (not JetStream) on the fanout subject so
+        that every subscriber receives a copy.
+        """
+        body_bytes, meta_headers = message_to_nats_body_and_headers(
+            message,
+            raw_body=self.nats_raw_body,
+            header_prefix=self.nats_metadata_header_prefix,
+            header_names=self.nats_metadata_header_names,
+        )
+        headers: dict | None = dict(meta_headers) if meta_headers else None
+        subject = self._fanout_subject(exchange)
+        self._run(self._nats_client.publish(subject, body_bytes, headers=headers))
+
+    def _open(self):
+        """Open NATS connection and acquire a JetStream context."""
+        client = super()._open()
+        if self._js is None:
+            self._js = client.jetstream()
+        return client
+
+    def _get_stream_name(self, queue):
+        """Get the stream name for a queue."""
+        prefix = self.options.get("stream_name_prefix", self.default_stream_name_prefix)
+        return f"{prefix}{queue}"
+
+    def _get_consumer_name(self, queue):
+        """Get the consumer name for a queue."""
+        prefix = self.options.get("consumer_name_prefix", self.default_consumer_name_prefix)
+        return f"{prefix}{queue}"
 
     def _ensure_stream(self, queue):
         """Ensure a stream exists for the queue."""
@@ -543,7 +757,33 @@ class Channel(virtual.Channel):
         )
 
     def _get(self, queue, **kwargs):
-        """Get a message from a queue."""
+        """Get a message from a queue.
+
+        If *queue* is bound to a fanout exchange, drain one message from the
+        Core NATS fanout inbox instead of polling JetStream.
+        """
+        # Fanout path: drain from the Core NATS subscription inbox.
+        if queue in self._fanout_inboxes:
+            inbox = self._fanout_inboxes[queue]
+
+            async def _drain_one():
+                return await asyncio.wait_for(
+                    inbox.get(),
+                    timeout=self.wait_time_seconds,
+                )
+
+            try:
+                msg = self._run(_drain_one())
+            except (asyncio.TimeoutError, TimeoutError):
+                raise Empty()
+            return nats_body_and_headers_to_message(
+                msg.data,
+                msg.headers,
+                header_prefix=self.nats_metadata_header_prefix,
+                header_names=self.nats_metadata_header_names,
+            )
+
+        # Normal JetStream path.
         self._ensure_stream(queue)
         self._ensure_consumer(queue)
 
@@ -621,124 +861,6 @@ class Channel(virtual.Channel):
         except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
             return False
 
-    def _open(self):
-        """Open a new connection to NATS."""
-        if self._nats_client is None:
-            self._nats_client = Client()
-            if self._nats_client is None:
-                raise RuntimeError("Failed to create NATS client")
-
-            host = self.conninfo.hostname or DEFAULT_HOST
-            port = self.conninfo.port or DEFAULT_PORT
-            self._run(
-                self._nats_client.connect(
-                    f"nats://{host}:{port}",
-                    user=self.conninfo.userid,
-                    password=self.conninfo.password,
-                    connect_timeout=self.connection_wait_time_seconds,
-                    error_cb=self._on_nats_error,
-                )
-            )
-            self._js = self._nats_client.jetstream()
-        return self._nats_client
-
-    @cached_property
-    def client(self):
-        """Get the NATS client."""
-        return self._open()
-
-    @property
-    def options(self):
-        """Get the transport options."""
-        return self.connection.client.transport_options
-
-    @property
-    def conninfo(self):
-        """Get the connection info."""
-        return self.connection.client
-
-    @cached_property
-    def wait_time_seconds(self):
-        """Get the wait time in seconds."""
-        return float(
-            self.options.get("wait_time_seconds", self.default_wait_time_seconds)
-        )
-
-    @cached_property
-    def connection_wait_time_seconds(self):
-        """Get the connection wait time in seconds."""
-        return float(
-            self.options.get(
-                "connection_wait_time_seconds",
-                self.default_connection_wait_time_seconds,
-            )
-        )
-
-    @property
-    def nats_raw_body(self) -> bool:
-        """If ``True``, publish the application payload directly as msg.data.
-
-        Kombu envelope metadata is carried in NATS headers instead.
-        Default ``False`` (backward-compatible envelope-in-body behaviour).
-        """
-        return bool(self.options.get('nats_raw_body', False))
-
-    @property
-    def nats_metadata_header_prefix(self) -> str:
-        """Prefix applied to Kombu metadata header names in raw-body mode.
-
-        Default ``"Kombu-"``.  Must not start with ``"Nats-"`` as that
-        namespace is reserved for NATS/JetStream built-in headers.
-        """
-        prefix = self.options.get('nats_metadata_header_prefix', 'Kombu-')
-        if prefix.lower().startswith('nats-'):
-            logger.warning(
-                "nats_metadata_header_prefix %r begins with 'Nats-', which "
-                "is reserved for NATS/JetStream semantics.  Choose a "
-                "different prefix to avoid conflicts with built-in headers.",
-                prefix,
-            )
-        return prefix
-
-    @property
-    def nats_metadata_header_names(self):
-        """Optional dict of per-field Kombu metadata header name overrides.
-
-        Keys: ``"content_type"``, ``"content_encoding"``, ``"headers"``,
-        ``"properties"``, ``"delivery_info"``.  Only specified keys are
-        overridden; others fall back to :data:`DEFAULT_METADATA_HEADER_NAMES`.
-        """
-        return self.options.get('nats_metadata_header_names', None)
-
-    async def _on_nats_error(self, exc: Exception) -> None:
-        """Async error callback passed to nats-py on connect.
-
-        Drain-timeout errors during ``Channel.close()`` are expected and
-        handled in Python; suppress the default nats-py stderr print for
-        them.  All other errors are forwarded to the Kombu logger.
-        """
-        if isinstance(exc, nats.errors.DrainTimeoutError):
-            logger.debug("NATS drain timed out (suppressed): %s", exc)
-        else:
-            logger.warning("NATS error: %s", exc)
-
-    def close(self):
-        """Close the channel, draining the NATS client then stopping the event loop thread."""
-        if self._nats_client is not None:
-            try:
-                try:
-                    self._run(self._nats_client.drain())
-                except nats.errors.DrainTimeoutError:
-                    logger.debug("NATS drain timed out during channel close; closing anyway")
-                self._run(self._nats_client.close())
-            finally:
-                self._nats_client = None
-                self._js = None
-        if not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._loop_thread.join(timeout=5)
-            self._loop.close()
-
     def ack_msg(self, msg):
         self._run(msg.nats_ack())
 
@@ -748,11 +870,173 @@ class Channel(virtual.Channel):
     def term_msg(self, msg):
         self._run(msg.nats_term())
 
+    def close(self):
+        """Unsubscribe fanout subscriptions then delegate to base close."""
+        for sub in list(self._fanout_subscriptions.values()):
+            try:
+                self._run(sub.unsubscribe())
+            except Exception:
+                pass
+        self._fanout_subscriptions.clear()
+        self._fanout_inboxes.clear()
+        self._fanout_queue_to_exchange.clear()
+        super().close()
+
+
+# ---------------------------------------------------------------------------
+# Core NATS channel (at-most-once, push-subscribe)
+# ---------------------------------------------------------------------------
+
+#: Maximum number of unread messages held per-subject in Core NATS inbox queues.
+#: When the inbox is full the oldest message is dropped (head-drop policy).
+MAX_INBOX_SIZE = 1000
+
+
+class CoreNATSChannel(Channel):
+    """Core NATS channel — at-most-once delivery via push subscriptions.
+
+    Uses plain Core NATS ``nc.publish`` / ``nc.subscribe`` with no JetStream
+    streams or consumers.  Each subscribed subject gets a bounded
+    :class:`asyncio.Queue` inbox; messages are head-dropped when full.
+
+    Acknowledgement is a no-op: Core NATS has no broker-side ack.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._inbox: dict[str, asyncio.Queue] = {}
+        self._subscriptions: dict = {}
+        super().__init__(*args, **kwargs)
+
+    # -- Subscription management -----------------------------------------
+
+    async def _subscribe(self, subject: str, queue_group: str) -> None:
+        """Subscribe to *subject* with *queue_group*, backing it with an inbox queue.
+
+        The inbox queue is created **before** ``nc.subscribe()`` is called so
+        that the message callback never sees a missing key even on the very
+        first delivery.
+        """
+        # Create the inbox queue first so the callback can always find it.
+        self._inbox[subject] = asyncio.Queue(maxsize=MAX_INBOX_SIZE)
+
+        async def _msg_handler(msg):
+            try:
+                self._inbox[subject].put_nowait(msg)
+            except asyncio.QueueFull:
+                # Head-drop: discard the oldest message and enqueue the new one.
+                try:
+                    self._inbox[subject].get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self._inbox[subject].put_nowait(msg)
+
+        sub = await self._nats_client.subscribe(
+            subject, queue=queue_group, cb=_msg_handler
+        )
+        self._subscriptions[subject] = sub
+
+    # -- Subject mapping -------------------------------------------------
+
+    @staticmethod
+    def _queue_to_subject(queue: str) -> str:
+        """Map a Kombu queue name to a Core NATS subject."""
+        return f"celery.queue.{queue}"
+
+    # -- Virtual transport interface -------------------------------------
+
+    def _put(self, queue, message, **kwargs):
+        """Publish a message to the Core NATS subject for *queue*."""
+        subject = self._queue_to_subject(queue)
+        body_bytes, _ = message_to_nats_body_and_headers(
+            message,
+            raw_body=self.nats_raw_body,
+            header_prefix=self.nats_metadata_header_prefix,
+            header_names=self.nats_metadata_header_names,
+        )
+        self._run(self._nats_client.publish(subject, body_bytes))
+
+    def _get(self, queue, **kwargs):
+        """Drain one message from the inbox for *queue*; raise :exc:`Empty` on timeout."""
+        subject = self._queue_to_subject(queue)
+        if subject not in self._subscriptions:
+            self._run(self._subscribe(subject, queue))
+
+        async def _drain_one():
+            return await asyncio.wait_for(
+                self._inbox[subject].get(),
+                timeout=self.wait_time_seconds,
+            )
+
+        try:
+            msg = self._run(_drain_one())
+        except (asyncio.TimeoutError, TimeoutError):
+            raise Empty()
+
+        return nats_body_and_headers_to_message(
+            msg.data,
+            msg.headers,
+            header_prefix=self.nats_metadata_header_prefix,
+            header_names=self.nats_metadata_header_names,
+        )
+
+    def _new_queue(self, queue, **kwargs):
+        """Declare queue: subscribe to the corresponding subject if not already done."""
+        subject = self._queue_to_subject(queue)
+        if subject not in self._subscriptions:
+            self._run(self._subscribe(subject, queue))
+        return queue
+
+    def _has_queue(self, queue, **kwargs):
+        subject = self._queue_to_subject(queue)
+        return subject in self._subscriptions
+
+    def _size(self, queue):
+        subject = self._queue_to_subject(queue)
+        q = self._inbox.get(subject)
+        return q.qsize() if q is not None else 0
+
+    def _delete(self, queue, *args, **kwargs):
+        subject = self._queue_to_subject(queue)
+        sub = self._subscriptions.pop(subject, None)
+        if sub is not None:
+            try:
+                self._run(sub.unsubscribe())
+            except Exception:
+                pass
+        self._inbox.pop(subject, None)
+
+    # -- Ack semantics (no-ops) ------------------------------------------
+
+    def basic_ack(self, delivery_tag, multiple=False):
+        """No-op: Core NATS has no broker-side acknowledgement."""
+        self.qos._not_yet_acked.pop(delivery_tag, None)
+
+    def basic_nack(self, delivery_tag, multiple=False, requeue=True):
+        """No-op: Core NATS has no broker-side negative-acknowledgement."""
+        self.qos._not_yet_acked.pop(delivery_tag, None)
+
+    def basic_reject(self, delivery_tag, requeue=False):
+        """No-op: Core NATS has no broker-side reject."""
+        self.qos._not_yet_acked.pop(delivery_tag, None)
+
+    # -- Close -----------------------------------------------------------
+
+    def close(self):
+        """Unsubscribe all active subscriptions, then close the channel."""
+        for sub in list(self._subscriptions.values()):
+            try:
+                self._run(sub.unsubscribe())
+            except Exception:
+                pass
+        self._subscriptions.clear()
+        self._inbox.clear()
+        super().close()
+
 
 class Transport(virtual.Transport):
     """NATS JetStream Transport."""
 
-    Channel = Channel
+    Channel = JetStreamChannel
 
     default_port = DEFAULT_PORT
 
@@ -766,6 +1050,26 @@ class Transport(virtual.Transport):
         if Client is None:
             raise ImportError("nats-py is not installed")
         super().__init__(client, **kwargs)
+
+    def _channel_cls_for(self, connection) -> type:
+        """Return the channel class appropriate for *connection*'s URL scheme.
+
+        ``nats+core://`` → :class:`CoreNATSChannel`
+        All other schemes (``nats://``, ``nats+jetstream://``) → :class:`JetStreamChannel`
+        """
+        scheme = getattr(connection.client, 'transport', 'nats') or 'nats'
+        if scheme == 'nats+core':
+            return CoreNATSChannel
+        return JetStreamChannel
+
+    def create_channel(self, connection):
+        """Create a channel whose type is selected by the URL scheme."""
+        try:
+            return self._avail_channels.pop()
+        except IndexError:
+            channel = self._channel_cls_for(connection)(connection)
+            self.channels.append(channel)
+            return channel
 
     def drain_events(self, connection, **kwargs):
         return super().drain_events(connection, **kwargs)

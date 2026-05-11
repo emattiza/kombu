@@ -21,11 +21,13 @@ import nats.js.errors  # noqa: E402
 
 from kombu.transport.nats import DEFAULT_HOST  # noqa: E402
 from kombu.transport.nats import DEFAULT_METADATA_HEADER_NAMES  # noqa: E402
-from kombu.transport.nats import (DEFAULT_PORT, Channel, Message,  # noqa: E402
-                                  QoS, Transport, decode_nats_header_value,
+from kombu.transport.nats import (DEFAULT_PORT, Channel, JetStreamChannel,  # noqa: E402
+                                  MAX_INBOX_SIZE, Message, QoS, Transport,
+                                  CoreNATSChannel, decode_nats_header_value,
                                   encode_nats_header_value,
                                   message_to_nats_body_and_headers,
                                   nats_body_and_headers_to_message)
+from kombu.transport.virtual.base import BrokerState  # noqa: E402
 
 # Convenience aliases for real nats exception classes used as side-effects.
 _NotFoundError = nats.js.errors.NotFoundError
@@ -59,13 +61,13 @@ def mock_connection():
 
 @pytest.fixture
 def channel(mock_connection):
-    """Channel with _open mocked out (no real NATS connection)."""
+    """JetStreamChannel with _open mocked out (no real NATS connection)."""
     mock_nc = MagicMock()
     mock_js = MagicMock()
     mock_nc.jetstream.return_value = mock_js
 
-    with patch.object(Channel, '_open', return_value=mock_nc):
-        ch = Channel(connection=mock_connection)
+    with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+        ch = JetStreamChannel(connection=mock_connection)
 
     # Replace the cached_property value with our mocks.
     ch.__dict__['client'] = mock_nc
@@ -94,19 +96,19 @@ class test_Channel_loop:
         mock_nc2 = MagicMock()
         mock_js2 = MagicMock()
         mock_nc2.jetstream.return_value = mock_js2
-        with patch.object(Channel, '_open', return_value=mock_nc2):
-            ch2 = Channel(connection=mock_connection)
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc2):
+            ch2 = JetStreamChannel(connection=mock_connection)
         ch2.__dict__['client'] = mock_nc2
         assert channel._loop is not ch2._loop
 
     def test_global_event_loop_not_mutated(self):
-        """Creating a Channel must not call asyncio.set_event_loop()."""
+        """Creating a JetStreamChannel must not call asyncio.set_event_loop()."""
         conn = _make_connection()
         mock_nc = MagicMock()
         mock_nc.jetstream.return_value = MagicMock()
         with patch('asyncio.set_event_loop') as mock_set:
-            with patch.object(Channel, '_open', return_value=mock_nc):
-                ch = Channel(connection=conn)
+            with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+                ch = JetStreamChannel(connection=conn)
             ch.__dict__['client'] = mock_nc
         mock_set.assert_not_called()
 
@@ -630,8 +632,8 @@ class test_Channel:
         mock_nc.jetstream.return_value = MagicMock()
 
         with patch('kombu.transport.nats.Client', return_value=mock_nc):
-            with patch.object(Channel, '_open', return_value=mock_nc):
-                ch = Channel(connection=mock_connection)
+            with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+                ch = JetStreamChannel(connection=mock_connection)
             ch._nats_client = mock_nc
 
         assert ch._nats_client is mock_nc
@@ -650,11 +652,12 @@ class test_Channel:
         mock_connection.client.hostname = None
         mock_connection.client.port = None
 
-        with patch.object(Channel, '_open', return_value=mock_nc):
-            ch = Channel(connection=mock_connection)
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+            ch = JetStreamChannel(connection=mock_connection)
 
         # Reset client so _open() will actually run the connection logic.
         ch._nats_client = None
+        ch._js = None
         with patch('kombu.transport.nats.Client', return_value=mock_nc):
             ch._open()
 
@@ -668,7 +671,7 @@ class test_Channel:
     def test_channel_init_raises_without_nats(self, mock_connection):
         with patch('kombu.transport.nats.Client', None):
             with pytest.raises(ImportError, match='nats-py is not installed'):
-                Channel(connection=mock_connection)
+                JetStreamChannel(connection=mock_connection)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,8 +1167,8 @@ class test_wire_format_tolerance:
         mock_nc = MagicMock()
         mock_js = MagicMock()
         mock_nc.jetstream.return_value = mock_js
-        with patch.object(Channel, '_open', return_value=mock_nc):
-            ch = Channel(connection=mock_connection)
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+            ch = JetStreamChannel(connection=mock_connection)
         ch.__dict__['client'] = mock_nc
         ch._nats_client = mock_nc
         ch._js = mock_js
@@ -1233,13 +1236,13 @@ class test_channel_raw_body:
 
     @pytest.fixture
     def clean_channel(self, mock_connection):
-        """Channel configured with nats_raw_body=True."""
+        """JetStreamChannel configured with nats_raw_body=True."""
         mock_connection.client.transport_options = {'nats_raw_body': True}
         mock_nc = MagicMock()
         mock_js = MagicMock()
         mock_nc.jetstream.return_value = mock_js
-        with patch.object(Channel, '_open', return_value=mock_nc):
-            ch = Channel(connection=mock_connection)
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+            ch = JetStreamChannel(connection=mock_connection)
         ch.__dict__['client'] = mock_nc
         ch._nats_client = mock_nc
         ch._js = mock_js
@@ -1356,8 +1359,8 @@ class test_channel_raw_body:
         mock_nc = MagicMock()
         mock_js = MagicMock()
         mock_nc.jetstream.return_value = mock_js
-        with patch.object(Channel, '_open', return_value=mock_nc):
-            ch = Channel(connection=mock_connection)
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+            ch = JetStreamChannel(connection=mock_connection)
         ch.__dict__['client'] = mock_nc
         ch._nats_client = mock_nc
         ch._js = mock_js
@@ -1436,3 +1439,419 @@ class test_channel_raw_body:
         result = channel._get('myqueue')
         assert result['content-type'] == 'application/json'
         assert result['body'] == 'aGVsbG8='
+
+
+# ---------------------------------------------------------------------------
+# test_CoreNATSChannel
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def core_channel(mock_connection):
+    """CoreNATSChannel with _open mocked out (no real NATS connection)."""
+    mock_nc = MagicMock()
+    mock_nc.subscribe = AsyncMock()
+    mock_nc.publish = AsyncMock()
+
+    with patch.object(CoreNATSChannel, '_open', return_value=mock_nc):
+        ch = CoreNATSChannel(connection=mock_connection)
+
+    ch.__dict__['client'] = mock_nc
+    ch._nats_client = mock_nc
+    ch._inbox = {}
+    ch._subscriptions = {}
+    return ch
+
+
+class test_CoreNATSChannel:
+    """Unit tests for CoreNATSChannel: inbox ordering, head-drop, and ack no-ops."""
+
+    # -- _subscribe: inbox created before nc.subscribe -------------------
+
+    def test_inbox_created_before_subscribe(self, core_channel):
+        """The inbox queue must exist before nc.subscribe() is called."""
+        inbox_created_first = []
+
+        async def _fake_subscribe(subject, queue, cb):
+            # At this point the inbox must already be present.
+            inbox_created_first.append(subject in core_channel._inbox)
+            mock_sub = MagicMock()
+            mock_sub.unsubscribe = AsyncMock()
+            return mock_sub
+
+        core_channel._nats_client.subscribe = _fake_subscribe
+        core_channel._run(core_channel._subscribe('celery.queue.test', 'test'))
+        assert inbox_created_first == [True], (
+            "_inbox[subject] must be created BEFORE nc.subscribe() is called"
+        )
+
+    def test_subscribe_stores_subscription(self, core_channel):
+        mock_sub = MagicMock()
+        mock_sub.unsubscribe = AsyncMock()
+        core_channel._nats_client.subscribe = AsyncMock(return_value=mock_sub)
+        core_channel._run(core_channel._subscribe('celery.queue.q', 'q'))
+        assert 'celery.queue.q' in core_channel._subscriptions
+        assert 'celery.queue.q' in core_channel._inbox
+
+    # -- head-drop policy ------------------------------------------------
+
+    def test_head_drop_when_inbox_full(self, core_channel):
+        """When inbox is full, oldest message is dropped and new one is added."""
+        subject = 'celery.queue.hdrop'
+        # Fill the inbox completely.
+        q = asyncio.Queue(maxsize=MAX_INBOX_SIZE)
+        for i in range(MAX_INBOX_SIZE):
+            msg = MagicMock()
+            msg.data = f"msg-{i}".encode()
+            q.put_nowait(msg)
+        core_channel._inbox[subject] = q
+
+        # Simulate the message callback arriving with a new message.
+        new_msg = MagicMock()
+        new_msg.data = b"new"
+
+        async def _trigger():
+            try:
+                core_channel._inbox[subject].put_nowait(new_msg)
+            except asyncio.QueueFull:
+                try:
+                    core_channel._inbox[subject].get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                core_channel._inbox[subject].put_nowait(new_msg)
+
+        core_channel._run(_trigger())
+        assert core_channel._inbox[subject].qsize() == MAX_INBOX_SIZE
+        # The last item must be the new message (oldest was dropped).
+        # Drain and check the last one.
+        items = []
+        while not core_channel._inbox[subject].empty():
+            items.append(core_channel._inbox[subject].get_nowait())
+        assert items[-1] is new_msg
+
+    # -- _put publishes to correct subject --------------------------------
+
+    def test_put_publishes_to_correct_subject(self, core_channel):
+        core_channel._nats_client.publish = AsyncMock()
+        message = {'body': b'hello'}
+        core_channel._put('myqueue', message)
+        core_channel._nats_client.publish.assert_awaited_once()
+        subject_arg = core_channel._nats_client.publish.call_args[0][0]
+        assert subject_arg == 'celery.queue.myqueue'
+
+    # -- _get raises Empty on timeout ------------------------------------
+
+    def test_get_raises_empty_on_timeout(self, core_channel):
+        subject = 'celery.queue.emptyq'
+        q = asyncio.Queue(maxsize=MAX_INBOX_SIZE)
+        core_channel._inbox[subject] = q
+        mock_sub = MagicMock()
+        core_channel._subscriptions[subject] = mock_sub
+        # Queue is empty — wait_for will time out.
+        core_channel.__dict__['wait_time_seconds'] = 0.01
+        with pytest.raises(Empty):
+            core_channel._get('emptyq')
+
+    # -- _get decodes message body ---------------------------------------
+
+    def test_get_decodes_message(self, core_channel):
+        import json
+        subject = 'celery.queue.dq'
+        q = asyncio.Queue(maxsize=MAX_INBOX_SIZE)
+        envelope = {'body': 'hi', 'content-type': 'application/json'}
+        fake_msg = MagicMock()
+        fake_msg.data = json.dumps(envelope).encode()
+        fake_msg.headers = None
+        q.put_nowait(fake_msg)
+        core_channel._inbox[subject] = q
+        core_channel._subscriptions[subject] = MagicMock()
+
+        result = core_channel._get('dq')
+        assert result['body'] == 'hi'
+
+    # -- ack/nack/reject are no-ops --------------------------------------
+
+    def test_basic_ack_is_noop(self, core_channel):
+        core_channel.qos._not_yet_acked['tag-1'] = MagicMock()
+        core_channel.basic_ack('tag-1')
+        assert 'tag-1' not in core_channel.qos._not_yet_acked
+
+    def test_basic_nack_is_noop(self, core_channel):
+        core_channel.qos._not_yet_acked['tag-2'] = MagicMock()
+        core_channel.basic_nack('tag-2')
+        assert 'tag-2' not in core_channel.qos._not_yet_acked
+
+    def test_basic_reject_is_noop(self, core_channel):
+        core_channel.qos._not_yet_acked['tag-3'] = MagicMock()
+        core_channel.basic_reject('tag-3')
+        assert 'tag-3' not in core_channel.qos._not_yet_acked
+
+    # -- close unsubscribes all subs -------------------------------------
+
+    def test_close_unsubscribes_all(self, core_channel):
+        sub1 = MagicMock()
+        sub1.unsubscribe = AsyncMock()
+        sub2 = MagicMock()
+        sub2.unsubscribe = AsyncMock()
+        core_channel._subscriptions = {
+            'celery.queue.a': sub1,
+            'celery.queue.b': sub2,
+        }
+        core_channel._inbox = {
+            'celery.queue.a': asyncio.Queue(),
+            'celery.queue.b': asyncio.Queue(),
+        }
+        mock_nc = MagicMock()
+        mock_nc.drain = AsyncMock()
+        mock_nc.close = AsyncMock()
+        core_channel._nats_client = mock_nc
+
+        core_channel.close()
+
+        sub1.unsubscribe.assert_awaited_once()
+        sub2.unsubscribe.assert_awaited_once()
+        assert core_channel._subscriptions == {}
+        assert core_channel._inbox == {}
+
+
+# ---------------------------------------------------------------------------
+# test_Transport_url_routing (Task 1.4)
+# ---------------------------------------------------------------------------
+
+
+class test_Transport_url_routing:
+    """Transport.create_channel() dispatches based on URL scheme."""
+
+    def setup_method(self):
+        self.mock_client = MagicMock()
+        self.mock_client.transport_options = {}
+
+    def _make_conn(self, scheme):
+        conn = MagicMock()
+        conn.client.transport = scheme
+        conn.client.transport_options = {}
+        conn.client.port = DEFAULT_PORT
+        conn.client.hostname = 'localhost'
+        conn.client.userid = None
+        conn.client.password = None
+        conn._used_channel_ids = array('H')
+        conn.channel_max = 65535
+        conn.default_port = DEFAULT_PORT
+        return conn
+
+    def test_nats_url_creates_jetstream_channel(self):
+        transport = Transport(self.mock_client)
+        conn = self._make_conn('nats')
+        assert transport._channel_cls_for(conn) is JetStreamChannel
+
+    def test_nats_plus_jetstream_url_creates_jetstream_channel(self):
+        transport = Transport(self.mock_client)
+        conn = self._make_conn('nats+jetstream')
+        assert transport._channel_cls_for(conn) is JetStreamChannel
+
+    def test_nats_plus_core_url_creates_core_channel(self):
+        transport = Transport(self.mock_client)
+        conn = self._make_conn('nats+core')
+        assert transport._channel_cls_for(conn) is CoreNATSChannel
+
+    def test_unknown_scheme_defaults_to_jetstream(self):
+        transport = Transport(self.mock_client)
+        conn = self._make_conn('nats+unknown')
+        assert transport._channel_cls_for(conn) is JetStreamChannel
+
+
+# ---------------------------------------------------------------------------
+# test_JetStreamChannel_fanout  (broadcast regression suite)
+# ---------------------------------------------------------------------------
+
+class test_JetStreamChannel_fanout:
+    """Regression tests for fanout/broadcast semantics.
+
+    Core requirement: one published message → N subscribers all receive it,
+    using Core NATS pub/sub (no queue group) on the fanout subject.
+    """
+
+    @pytest.fixture()
+    def fanout_channel(self, mock_connection):
+        """JetStreamChannel with publish/subscribe mocked for fanout testing."""
+        mock_nc = MagicMock()
+        mock_nc.jetstream.return_value = MagicMock()
+        mock_nc.subscribe = AsyncMock()
+        mock_nc.publish = AsyncMock()
+        # Use a real BrokerState so exchange_declare/queue_bind work correctly.
+        mock_connection.state = BrokerState()
+
+        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+            ch = JetStreamChannel(connection=mock_connection)
+
+        ch.__dict__['client'] = mock_nc
+        ch._nats_client = mock_nc
+        ch._js = mock_nc.jetstream.return_value
+        ch._streams = set()
+        ch._js_consumers = set()
+        return ch
+
+    def test_supports_fanout_is_true(self):
+        """JetStreamChannel.supports_fanout must be True."""
+        assert JetStreamChannel.supports_fanout is True
+
+    def test_fanout_subject_format(self, fanout_channel):
+        """Fanout subject must use 'celery.fanout.<exchange>' scheme."""
+        assert fanout_channel._fanout_subject('celery.pidbox') == 'celery.fanout.celery.pidbox'
+
+    def test_queue_bind_subscribes_for_fanout_exchange(self, fanout_channel):
+        """_queue_bind() subscribes to the fanout subject via Core NATS."""
+        # Declare a fanout exchange in state.
+        fanout_channel.exchange_declare('test.pidbox', type='fanout', durable=False)
+        fanout_channel._queue_bind('test.pidbox', '', '', 'worker-a.test.pidbox')
+
+        # nc.subscribe must have been called with the fanout subject (no queue group).
+        assert fanout_channel._nats_client.subscribe.called
+        call_kwargs = fanout_channel._nats_client.subscribe.call_args
+        subject_arg = call_kwargs[0][0] if call_kwargs[0] else call_kwargs[1].get('subject')
+        assert subject_arg == 'celery.fanout.test.pidbox'
+        # Must NOT use a queue group (that would break broadcast semantics).
+        assert call_kwargs[1].get('queue', '') == '' or 'queue' not in call_kwargs[1]
+
+    def test_put_fanout_publishes_to_core_nats(self, fanout_channel):
+        """_put_fanout() uses nc.publish (Core NATS) not js.publish (JetStream)."""
+        message = {
+            'body': 'ping',
+            'headers': {},
+            'properties': {'delivery_tag': '1', 'delivery_info': {}},
+            'content-type': 'application/json',
+            'content-encoding': 'utf-8',
+        }
+        fanout_channel._put_fanout('celery.pidbox', message, '')
+        fanout_channel._nats_client.publish.assert_called_once()
+        call_args = fanout_channel._nats_client.publish.call_args[0]
+        assert call_args[0] == 'celery.fanout.celery.pidbox'
+        # js.publish must NOT have been called.
+        fanout_channel._js.publish.assert_not_called()
+
+    def test_two_workers_both_receive_fanout_message(self, mock_connection):
+        """Broadcast regression: one message sent, N subscribers all receive it.
+
+        Simulates two workers each with their own JetStreamChannel. Publishing
+        to the fanout exchange subject must deliver one copy to each worker's
+        fanout inbox.
+        """
+        received_by = {'worker_a': [], 'worker_b': []}
+        subscriptions = {}
+
+        def _subscribe_side_effect(subject, cb=None, **kw):
+            """Track subscriptions by subject; return a mock sub."""
+            subs_for_subject = subscriptions.setdefault(subject, [])
+            sub_mock = MagicMock()
+            sub_mock.subject = subject
+            sub_mock.cb = cb
+            subs_for_subject.append(sub_mock)
+            f = asyncio.get_event_loop().create_future()
+            f.set_result(sub_mock)
+            return f
+
+        async def _publish_side_effect(subject, data, headers=None):
+            """Fan out to every subscriber registered for the subject."""
+            for sub in subscriptions.get(subject, []):
+                msg = MagicMock()
+                msg.data = data
+                msg.headers = headers or {}
+                if sub.cb is not None:
+                    await sub.cb(msg)
+
+        def _make_worker_channel(worker_name, worker_received):
+            """Create a JetStreamChannel for a simulated worker."""
+            mock_nc = MagicMock()
+            mock_nc.jetstream.return_value = MagicMock()
+            mock_nc.subscribe = AsyncMock(side_effect=_subscribe_side_effect)
+            mock_nc.publish = AsyncMock(side_effect=_publish_side_effect)
+            # Each worker needs its own real BrokerState.
+            worker_conn = _make_connection()
+            worker_conn.state = BrokerState()
+
+            with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
+                ch = JetStreamChannel(connection=worker_conn)
+
+            ch.__dict__['client'] = mock_nc
+            ch._nats_client = mock_nc
+            ch._js = mock_nc.jetstream.return_value
+            ch._streams = set()
+            ch._js_consumers = set()
+            return ch
+
+        ch_a = _make_worker_channel('worker_a', received_by['worker_a'])
+        ch_b = _make_worker_channel('worker_b', received_by['worker_b'])
+
+        # Both workers declare + bind to the pidbox fanout exchange.
+        for ch in (ch_a, ch_b):
+            ch.exchange_declare('celery.pidbox', type='fanout', durable=False)
+            ch._queue_bind('celery.pidbox', '', '', 'worker.celery.pidbox')
+
+        # Both are now subscribed to celery.fanout.celery.pidbox.
+        assert 'celery.fanout.celery.pidbox' in subscriptions
+        assert len(subscriptions['celery.fanout.celery.pidbox']) == 2
+
+        # Publish one inspect-ping message via channel A.
+        message = {
+            'body': '{"method": "ping", "arguments": {}}',
+            'headers': {},
+            'properties': {'delivery_tag': 'tag-1', 'delivery_info': {}},
+            'content-type': 'application/json',
+            'content-encoding': 'utf-8',
+        }
+        ch_a._put_fanout('celery.pidbox', message, '')
+
+        # Both channel A and B inboxes must each have one message.
+        inbox_a = ch_a._fanout_inboxes.get('worker.celery.pidbox')
+        inbox_b = ch_b._fanout_inboxes.get('worker.celery.pidbox')
+        assert inbox_a is not None, "Worker A has no fanout inbox"
+        assert inbox_b is not None, "Worker B has no fanout inbox"
+        assert inbox_a.qsize() == 1, f"Worker A inbox has {inbox_a.qsize()} messages, expected 1"
+        assert inbox_b.qsize() == 1, f"Worker B inbox has {inbox_b.qsize()} messages, expected 1"
+
+    def test_close_unsubscribes_fanout_subs(self, fanout_channel):
+        """close() must drain fanout subscriptions cleanly."""
+        mock_sub = MagicMock()
+        mock_sub.unsubscribe = AsyncMock()
+        fanout_channel._fanout_subscriptions['celery.pidbox'] = mock_sub
+        fanout_channel._fanout_inboxes['worker.celery.pidbox'] = asyncio.Queue()
+        # Override base close to avoid real NATS drain.
+        with patch.object(Channel, 'close'):
+            fanout_channel.close()
+        mock_sub.unsubscribe.assert_called_once()
+        assert len(fanout_channel._fanout_subscriptions) == 0
+        assert len(fanout_channel._fanout_inboxes) == 0
+
+    def test_get_fanout_queue_drains_inbox(self, fanout_channel):
+        """_get() on a fanout queue drains from the Core NATS inbox."""
+        import json as _json
+        queue = 'worker.celery.pidbox'
+        inbox = asyncio.Queue()
+        fanout_channel._fanout_inboxes[queue] = inbox
+
+        # Pre-fill the inbox with a JSON-envelope message.
+        payload = _json.dumps({
+            'body': 'pong',
+            'headers': {},
+            'properties': {'delivery_tag': 't1', 'delivery_info': {}},
+            'content-type': 'application/json',
+            'content-encoding': 'utf-8',
+        }).encode()
+        msg = MagicMock()
+        msg.data = payload
+        msg.headers = {}
+        inbox.put_nowait(msg)
+
+        result = fanout_channel._get(queue)
+        assert result['body'] == 'pong'
+        assert inbox.qsize() == 0
+
+    def test_get_fanout_raises_empty_on_timeout(self, fanout_channel):
+        """_get() on empty fanout inbox raises Empty (not hangs)."""
+        from queue import Empty
+        fanout_channel._fanout_inboxes['worker.celery.pidbox'] = asyncio.Queue()
+        # Tiny wait to keep test fast.
+        fanout_channel._nats_client.transport_options = {}
+        fanout_channel.__class__.default_wait_time_seconds = 0.01
+        with pytest.raises(Empty):
+            fanout_channel._get('worker.celery.pidbox')
