@@ -33,11 +33,11 @@ def process_msg(body, message):
     message.ack()
 
 
-print(f"Consuming with nats_clean_body={clean_body} from nats://{server}:4222")
+print(f"Consuming with nats_raw_body={clean_body} from nats://{server}:4222")
 
 with Connection(
     f"nats://{server}:4222",
-    transport_options={"nats_clean_body": clean_body},
+    transport_options={"nats_raw_body": clean_body},
 ) as connection:
     with Consumer(connection, msg_queue, callbacks=[process_msg]) as consumer:
         for _ in eventloop(connection):

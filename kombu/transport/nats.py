@@ -40,13 +40,13 @@ Transport Options
 * ``consumer_name_prefix`` - Prefix used when naming JetStream consumers. Default ``"CONSUMER_"``.
   For example, setting ``consumer_name_prefix`` to ``"myapp_"`` causes queue
   ``tasks`` to use a consumer named ``myapp_tasks``.
-* ``nats_clean_body`` - If ``True``, publish the serialized application payload
-  directly as the NATS message body instead of wrapping it in a Kombu JSON
-  envelope.  Kombu metadata (content-type, properties, etc.) is carried in NATS
-  headers with the configured prefix.  Default ``False`` (backward-compatible
+* ``nats_raw_body`` - If ``True``, publish the application payload directly as
+  the NATS message body instead of wrapping it in a Kombu JSON envelope.
+  Kombu metadata (content-type, properties, etc.) is carried in NATS headers
+  with the configured prefix.  Default ``False`` (backward-compatible
   envelope-in-body behaviour).
 * ``nats_metadata_header_prefix`` - Prefix applied to all Kombu metadata header
-  names when ``nats_clean_body=True``.  Default ``"Kombu-"``.  Must not start
+  names when ``nats_raw_body=True``.  Default ``"Kombu-"``.  Must not start
   with ``"Nats-"`` as that namespace is reserved for NATS/JetStream built-in
   headers.
 * ``nats_metadata_header_names`` - Optional :class:`dict` that overrides
@@ -59,12 +59,13 @@ Transport Options
 Per-message TTL is supported via the ``Nats-TTL`` JetStream header. When a
 message is published with a Kombu ``expiration`` property (in milliseconds),
 the transport sets the ``Nats-TTL`` header so NATS will expire the message
-after that duration.  This header is applied in both legacy and clean-body mode.
+after that duration.  This header is applied in both default and raw-body mode.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 from queue import Empty
 
 from kombu.transport import virtual
@@ -101,21 +102,14 @@ logger = get_logger(__name__)
 DEFAULT_PORT = 4222
 DEFAULT_HOST = "localhost"
 
-_event_loop: asyncio.AbstractEventLoop | None = None
-
-
-def get_event_loop() -> asyncio.AbstractEventLoop:
-    """Get or create the global event loop."""
-    global _event_loop
-    if _event_loop is None:
-        _event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_event_loop)
-    return _event_loop
-
 
 # ---------------------------------------------------------------------------
 # Clean-body mode: module-level constants and helpers
 # ---------------------------------------------------------------------------
+
+#: Allowed body types for raw-body mode.  Only these types can be safely
+#: published as NATS message data.
+_RAW_BODY_TYPES = (str, bytes, bytearray, memoryview, type(None))
 
 #: Default Kombu metadata header name suffixes (used with the configured
 #: prefix, e.g. ``"Kombu-"`` → ``"Kombu-Content-Type"``).
@@ -145,41 +139,43 @@ def encode_nats_header_value(value) -> str:
 def decode_nats_header_value(raw: str):
     """Decode a NATS header string back to a Python value.
 
-    Values whose first non-whitespace character is ``{`` or ``[`` are
-    JSON-parsed; all others are returned as plain strings.  An empty
-    string returns ``None``.
+    Attempts JSON parsing for every non-empty value so that integers,
+    booleans, ``null``, dicts, lists, and plain strings all round-trip
+    correctly.  Falls back to returning the raw string if JSON parsing
+    fails.  An empty string returns ``None``.
     """
     if not raw:
         return None
     stripped = raw.strip()
-    if stripped and stripped[0] in ('{', '['):
-        try:
-            return loads(stripped)
-        except Exception:
-            pass
-    return raw
+    try:
+        return loads(stripped)
+    except Exception:
+        return raw
 
 
 def message_to_nats_body_and_headers(
     message: dict,
     *,
-    clean_body: bool,
+    raw_body: bool,
     header_prefix: str,
     header_names: dict | None,
 ) -> tuple[bytes, dict]:
     """Convert a Kombu message dict to *(body_bytes, metadata_headers)*.
 
-    **Default mode** (``clean_body=False``):
+    **Default mode** (``raw_body=False``):
         *body_bytes* is the full Kombu JSON envelope serialised to bytes;
         *metadata_headers* is an empty dict.
 
-    **Clean-body mode** (``clean_body=True``):
+    **Raw-body mode** (``raw_body=True``):
         *body_bytes* is ``message['body']`` converted to bytes exactly as
         Kombu/the application provided it — no additional encoding or
         decoding is applied.  *metadata_headers* holds Kombu metadata under
         the configured header prefix.
+
+        Only :data:`_RAW_BODY_TYPES` are accepted; any other type raises
+        :exc:`TypeError`.
     """
-    if not clean_body:
+    if not raw_body:
         return str_to_bytes(dumps(message)), {}
 
     # Merge user-supplied header name overrides with defaults.
@@ -188,12 +184,20 @@ def message_to_nats_body_and_headers(
     # Publish the body exactly as provided by Kombu's serializer layer.
     # Serialization/encoding is entirely the caller's responsibility.
     body = message.get("body", b"")
-    if isinstance(body, str):
+    if not isinstance(body, _RAW_BODY_TYPES):
+        raise TypeError(
+            f"nats_raw_body mode: message body must be one of "
+            f"{[t.__name__ for t in _RAW_BODY_TYPES if t is not type(None)] + ['None']}, "
+            f"got {type(body).__name__!r}"
+        )
+    if body is None:
+        body_bytes = b""
+    elif isinstance(body, str):
         body_bytes = body.encode("utf-8")
-    elif isinstance(body, (bytes, bytearray)):
+    elif isinstance(body, memoryview):
         body_bytes = bytes(body)
     else:
-        body_bytes = b""
+        body_bytes = bytes(body)
 
     # Build the metadata header dict, skipping absent/empty values.
     headers: dict[str, str] = {}
@@ -212,6 +216,17 @@ def message_to_nats_body_and_headers(
     return body_bytes, headers
 
 
+def _has_kombu_metadata_headers(
+    flat_headers: dict,
+    header_prefix: str,
+    header_names: dict | None,
+) -> bool:
+    """Return ``True`` if *flat_headers* contains the Kombu content-type key."""
+    names = {**DEFAULT_METADATA_HEADER_NAMES, **(header_names or {})}
+    ct_key = f"{header_prefix}{names['content_type']}"
+    return ct_key in flat_headers
+
+
 def nats_body_and_headers_to_message(
     data: bytes,
     msg_headers,
@@ -221,23 +236,25 @@ def nats_body_and_headers_to_message(
 ) -> dict:
     """Reconstruct a Kombu message dict from NATS *data* and *msg_headers*.
 
-    If the configured metadata headers are absent the payload is assumed to
-    be a legacy Kombu JSON envelope and is parsed directly.
+    If the configured metadata headers are present the message is decoded as
+    raw-body mode.  Otherwise the payload is assumed to be a default Kombu
+    JSON envelope and is parsed directly.  Consumers can therefore read both
+    formats regardless of their local ``nats_raw_body`` setting.
     """
-    names = {**DEFAULT_METADATA_HEADER_NAMES, **(header_names or {})}
-    ct_key = f"{header_prefix}{names['content_type']}"
-
     # Normalise msg.headers: nats-py may give None, str values, or list values.
     flat: dict[str, str] = {}
     if isinstance(msg_headers, dict):
         for k, v in msg_headers.items():
             flat[k] = v[0] if isinstance(v, list) else v
 
-    if ct_key not in flat:
-        # Legacy path: payload is a full Kombu JSON envelope.
+    if not _has_kombu_metadata_headers(flat, header_prefix, header_names):
+        # Default path: payload is a full Kombu JSON envelope.
         return loads(data.decode())
 
-    # Clean-body path: reconstruct a Kombu envelope from the metadata headers.
+    names = {**DEFAULT_METADATA_HEADER_NAMES, **(header_names or {})}
+    ct_key = f"{header_prefix}{names['content_type']}"
+
+    # Raw-body path: reconstruct a Kombu envelope from the metadata headers.
     content_type = flat.get(ct_key) or ""
     content_encoding = flat.get(
         f"{header_prefix}{names['content_encoding']}"
@@ -346,6 +363,20 @@ class Channel(virtual.Channel):
 
         logger.debug("Host: %s Port: %s", host, port)
 
+        # Each channel owns its own private asyncio event loop running in a
+        # dedicated background thread.  This prevents re-entrancy errors when
+        # Celery (or any other caller) tries to ack/nak a message from a
+        # callback that executes while the loop is already running (e.g.
+        # task_acks_late=True + retries).  Using run_coroutine_threadsafe
+        # instead of run_until_complete makes _run safe from any thread.
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name=f"kombu-nats-{id(self)}",
+        )
+        self._loop_thread.start()
+
         self._nats_client: Client | None = None
         self._js: JetStreamContext | None = None
         self._streams = set()
@@ -364,6 +395,19 @@ class Channel(virtual.Channel):
         prefix = self.options.get("consumer_name_prefix", self.default_consumer_name_prefix)
         return f"{prefix}{queue}"
 
+    def _run(self, coro):
+        """Submit *coro* to this channel's background event loop and block until done.
+
+        Using :func:`asyncio.run_coroutine_threadsafe` instead of
+        ``run_until_complete`` means *_run* is safe to call from any thread,
+        including callbacks that fire while the loop is already processing
+        another coroutine (e.g. Celery ack callbacks during task retry).
+        """
+        if self._loop.is_closed():
+            raise RuntimeError("NATS event loop is closed")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
     def _ensure_stream(self, queue):
         """Ensure a stream exists for the queue."""
         stream_name = self._get_stream_name(queue)
@@ -375,8 +419,7 @@ class Channel(virtual.Channel):
 
         # First try to get stream info with a shorter timeout
         try:
-            loop = get_event_loop()
-            loop.run_until_complete(
+            self._run(
                 asyncio.wait_for(
                     self._js.stream_info(stream_name),
                     timeout=1.0  # Use a shorter timeout for the check
@@ -410,8 +453,7 @@ class Channel(virtual.Channel):
         user_cfg = self.options.get("stream_config") or {}
 
         try:
-            loop = get_event_loop()
-            loop.run_until_complete(
+            self._run(
                 asyncio.wait_for(
                     self._js.add_stream(stream_config, **user_cfg),
                     timeout=5.0  # Use a longer timeout for creation
@@ -421,7 +463,7 @@ class Channel(virtual.Channel):
         except nats.errors.TimeoutError:
             # If we timeout creating the stream, check if it was actually created
             try:
-                loop.run_until_complete(
+                self._run(
                     asyncio.wait_for(
                         self._js.stream_info(stream_name),
                         timeout=1.0
@@ -453,8 +495,7 @@ class Channel(virtual.Channel):
         user_cfg = self.options.get("consumer_config") or {}
 
         try:
-            loop = get_event_loop()
-            loop.run_until_complete(
+            self._run(
                 asyncio.wait_for(
                     self._js.add_consumer(name, consumer_config, **user_cfg),
                     timeout=5.0  # Use a longer timeout for consumer creation
@@ -464,7 +505,7 @@ class Channel(virtual.Channel):
         except nats.errors.TimeoutError:
             # If we timeout creating the consumer, check if it was actually created
             try:
-                loop.run_until_complete(
+                self._run(
                     asyncio.wait_for(
                         self._js.consumer_info(name, consumer_name),
                         timeout=1.0
@@ -482,12 +523,12 @@ class Channel(virtual.Channel):
 
         body_bytes, meta_headers = message_to_nats_body_and_headers(
             message,
-            clean_body=self.nats_clean_body,
+            raw_body=self.nats_raw_body,
             header_prefix=self.nats_metadata_header_prefix,
             header_names=self.nats_metadata_header_names,
         )
 
-        # Start from the metadata headers (empty dict in legacy mode).
+        # Start from the metadata headers (empty dict in default mode).
         headers: dict | None = dict(meta_headers) if meta_headers else None
 
         # Append the JetStream TTL header when expiration is set.
@@ -497,7 +538,7 @@ class Channel(virtual.Channel):
                 headers = {}
             headers['Nats-TTL'] = f"{expiration}ms"
 
-        get_event_loop().run_until_complete(
+        self._run(
             self._js.publish(queue, body_bytes, headers=headers)
         )
 
@@ -510,14 +551,14 @@ class Channel(virtual.Channel):
             raise RuntimeError("JetStream context not initialized")
 
         try:
-            pull_sub = get_event_loop().run_until_complete(
+            pull_sub = self._run(
                 self._js.pull_subscribe(
                     queue,
                     self._get_consumer_name(queue),
                     stream=self._get_stream_name(queue),
                 )
             )
-            msg = get_event_loop().run_until_complete(
+            msg = self._run(
                 pull_sub.fetch(1, timeout=self.wait_time_seconds)
             )[0]
 
@@ -543,7 +584,7 @@ class Channel(virtual.Channel):
 
         stream_name = self._get_stream_name(queue)
         try:
-            get_event_loop().run_until_complete(self._js.delete_stream(stream_name))
+            self._run(self._js.delete_stream(stream_name))
         except nats.js.errors.NotFoundError:
             pass
         finally:
@@ -555,7 +596,7 @@ class Channel(virtual.Channel):
             raise RuntimeError("JetStream context not initialized")
 
         try:
-            info = get_event_loop().run_until_complete(
+            info = self._run(
                 self._js.stream_info(self._get_stream_name(queue))
             )
             return info.state.messages
@@ -573,7 +614,7 @@ class Channel(virtual.Channel):
             raise RuntimeError("JetStream context not initialized")
 
         try:
-            get_event_loop().run_until_complete(
+            self._run(
                 self._js.stream_info(self._get_stream_name(queue))
             )
             return True
@@ -589,12 +630,13 @@ class Channel(virtual.Channel):
 
             host = self.conninfo.hostname or DEFAULT_HOST
             port = self.conninfo.port or DEFAULT_PORT
-            get_event_loop().run_until_complete(
+            self._run(
                 self._nats_client.connect(
                     f"nats://{host}:{port}",
                     user=self.conninfo.userid,
                     password=self.conninfo.password,
                     connect_timeout=self.connection_wait_time_seconds,
+                    error_cb=self._on_nats_error,
                 )
             )
             self._js = self._nats_client.jetstream()
@@ -633,17 +675,17 @@ class Channel(virtual.Channel):
         )
 
     @property
-    def nats_clean_body(self) -> bool:
+    def nats_raw_body(self) -> bool:
         """If ``True``, publish the application payload directly as msg.data.
 
         Kombu envelope metadata is carried in NATS headers instead.
         Default ``False`` (backward-compatible envelope-in-body behaviour).
         """
-        return bool(self.options.get('nats_clean_body', False))
+        return bool(self.options.get('nats_raw_body', False))
 
     @property
     def nats_metadata_header_prefix(self) -> str:
-        """Prefix applied to Kombu metadata header names in clean-body mode.
+        """Prefix applied to Kombu metadata header names in raw-body mode.
 
         Default ``"Kombu-"``.  Must not start with ``"Nats-"`` as that
         namespace is reserved for NATS/JetStream built-in headers.
@@ -668,23 +710,43 @@ class Channel(virtual.Channel):
         """
         return self.options.get('nats_metadata_header_names', None)
 
+    async def _on_nats_error(self, exc: Exception) -> None:
+        """Async error callback passed to nats-py on connect.
+
+        Drain-timeout errors during ``Channel.close()`` are expected and
+        handled in Python; suppress the default nats-py stderr print for
+        them.  All other errors are forwarded to the Kombu logger.
+        """
+        if isinstance(exc, nats.errors.DrainTimeoutError):
+            logger.debug("NATS drain timed out (suppressed): %s", exc)
+        else:
+            logger.warning("NATS error: %s", exc)
+
     def close(self):
-        """Close the channel."""
+        """Close the channel, draining the NATS client then stopping the event loop thread."""
         if self._nats_client is not None:
-            loop = get_event_loop()
-            loop.run_until_complete(self._nats_client.drain())
-            loop.run_until_complete(self._nats_client.close())
-            self._nats_client = None
-            self._js = None
+            try:
+                try:
+                    self._run(self._nats_client.drain())
+                except nats.errors.DrainTimeoutError:
+                    logger.debug("NATS drain timed out during channel close; closing anyway")
+                self._run(self._nats_client.close())
+            finally:
+                self._nats_client = None
+                self._js = None
+        if not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+            self._loop.close()
 
     def ack_msg(self, msg):
-        get_event_loop().run_until_complete(msg.nats_ack())
+        self._run(msg.nats_ack())
 
     def nak_msg(self, msg):
-        get_event_loop().run_until_complete(msg.nats_nak())
+        self._run(msg.nats_nak())
 
     def term_msg(self, msg):
-        get_event_loop().run_until_complete(msg.nats_term())
+        self._run(msg.nats_term())
 
 
 class Transport(virtual.Transport):
@@ -728,12 +790,14 @@ class Transport(virtual.Transport):
         logger.debug("Verify NATS connection to nats://%s:%s", host, port)
 
         client = Client()
+        loop = asyncio.new_event_loop()
         try:
-            loop = get_event_loop()
             loop.run_until_complete(client.connect(f"nats://{host}:{port}"))
             loop.run_until_complete(client.close())
             return True
         except ValueError:
             pass
+        finally:
+            loop.close()
 
         return False

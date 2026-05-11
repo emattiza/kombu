@@ -24,9 +24,9 @@ msg_queue = Queue("kombu_demo", exchange=exchange, routing_key="messages")
 
 transport_options = {
     "stream_config": {"storage": StorageType.FILE},
-    "nats_clean_body": clean_body,
+    "nats_raw_body": clean_body,
 }
-print(f"Publishing with nats_clean_body={clean_body} to nats://{server}:4222")
+print(f"Publishing with nats_raw_body={clean_body} to nats://{server}:4222")
 
 with Connection(f"nats://{server}:4222", transport_options=transport_options) as conn:
     producer = conn.Producer()
