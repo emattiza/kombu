@@ -65,6 +65,7 @@ after that duration.  This header is applied in both default and raw-body mode.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from queue import Empty
 
@@ -101,6 +102,10 @@ logger = get_logger(__name__)
 
 DEFAULT_PORT = 4222
 DEFAULT_HOST = "localhost"
+
+_JS_NAME_INVALID_CHARS = frozenset(".*>/\\")
+_JS_NAME_HASH_LEN = 12
+_JS_NAME_MAX_LENGTH = 240
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +156,36 @@ def decode_nats_header_value(raw: str):
         return loads(stripped)
     except Exception:
         return raw
+
+
+def _is_valid_js_resource_name(name: str) -> bool:
+    """Return ``True`` when *name* is safe for JetStream API resource paths."""
+    return bool(name) and name.isprintable() and not any(
+        ch.isspace() or ch in _JS_NAME_INVALID_CHARS for ch in name
+    )
+
+
+def normalize_js_resource_name(name: str) -> str:
+    """Normalize *name* for JetStream stream/consumer identifiers.
+
+    Queue subjects may legally contain characters like ``.`` that are unsafe in
+    JetStream API resource paths. Keep already-valid names unchanged, and
+    derive a readable, collision-resistant fallback only when normalization is
+    required.
+    """
+    if _is_valid_js_resource_name(name):
+        return name
+
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:_JS_NAME_HASH_LEN]
+    stem = "".join(
+        ch if ch.isprintable() and not ch.isspace() and ch not in _JS_NAME_INVALID_CHARS
+        else "_"
+        for ch in name
+    ).strip("_") or "js"
+    max_stem_len = _JS_NAME_MAX_LENGTH - len(digest) - 2
+    if len(stem) > max_stem_len:
+        stem = stem[:max_stem_len]
+    return f"{stem}__{digest}"
 
 
 def message_to_nats_body_and_headers(
@@ -615,12 +650,12 @@ class JetStreamChannel(Channel):
     def _get_stream_name(self, queue):
         """Get the stream name for a queue."""
         prefix = self.options.get("stream_name_prefix", self.default_stream_name_prefix)
-        return f"{prefix}{queue}"
+        return normalize_js_resource_name(f"{prefix}{queue}")
 
     def _get_consumer_name(self, queue):
         """Get the consumer name for a queue."""
         prefix = self.options.get("consumer_name_prefix", self.default_consumer_name_prefix)
-        return f"{prefix}{queue}"
+        return normalize_js_resource_name(f"{prefix}{queue}")
 
     def _ensure_stream(self, queue):
         """Ensure a stream exists for the queue."""

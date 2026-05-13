@@ -26,7 +26,8 @@ from kombu.transport.nats import (DEFAULT_PORT, Channel, JetStreamChannel,  # no
                                   CoreNATSChannel, decode_nats_header_value,
                                   encode_nats_header_value,
                                   message_to_nats_body_and_headers,
-                                  nats_body_and_headers_to_message)
+                                  nats_body_and_headers_to_message,
+                                  normalize_js_resource_name)
 from kombu.transport.virtual.base import BrokerState  # noqa: E402
 
 # Convenience aliases for real nats exception classes used as side-effects.
@@ -304,12 +305,30 @@ class test_Channel:
         channel.connection.client.transport_options = {'stream_name_prefix': 'myapp_'}
         assert channel._get_stream_name('myqueue') == 'myapp_myqueue'
 
+    def test_get_stream_name_sanitizes_dotted_queue(self, channel):
+        stream_name = channel._get_stream_name('celeryev.1234-5678')
+        assert stream_name.startswith('STREAM_celeryev_1234-5678__')
+        assert '.' not in stream_name
+
     def test_get_consumer_name_default_prefix(self, channel):
         assert channel._get_consumer_name('myqueue') == 'CONSUMER_myqueue'
 
     def test_get_consumer_name_custom_prefix(self, channel):
         channel.connection.client.transport_options = {'consumer_name_prefix': 'myapp_'}
         assert channel._get_consumer_name('myqueue') == 'myapp_myqueue'
+
+    def test_get_consumer_name_sanitizes_dotted_queue(self, channel):
+        consumer_name = channel._get_consumer_name('a.reply.celery.pidbox')
+        assert consumer_name.startswith('CONSUMER_a_reply_celery_pidbox__')
+        assert '.' not in consumer_name
+
+    def test_normalize_js_resource_name_preserves_valid_names(self):
+        assert normalize_js_resource_name('STREAM_celery') == 'STREAM_celery'
+
+    def test_normalize_js_resource_name_adds_hash_for_invalid_names(self):
+        normalized = normalize_js_resource_name('STREAM_celeryev.1234')
+        assert normalized.startswith('STREAM_celeryev_1234__')
+        assert '.' not in normalized
 
     def test_ensure_stream_uses_custom_stream_name(self, channel):
         channel.connection.client.transport_options = {'stream_name_prefix': 'myapp_'}
@@ -321,6 +340,16 @@ class test_Channel:
         stream_cfg = call_args[0][0]
         assert stream_cfg.name == 'myapp_myqueue'
 
+    def test_ensure_stream_sanitizes_dotted_queue_names(self, channel):
+        channel._js.stream_info = AsyncMock(side_effect=_NotFoundError())
+        channel._js.add_stream = AsyncMock()
+        channel._ensure_stream('celeryev.1234-5678')
+        call_args = channel._js.add_stream.call_args
+        stream_cfg = call_args[0][0]
+        assert stream_cfg.name.startswith('STREAM_celeryev_1234-5678__')
+        assert stream_cfg.subjects == ['celeryev.1234-5678']
+        assert '.' not in stream_cfg.name
+
     def test_ensure_consumer_uses_custom_consumer_name(self, channel):
         channel.connection.client.transport_options = {'consumer_name_prefix': 'myapp_'}
         channel._js.add_consumer = AsyncMock()
@@ -329,6 +358,14 @@ class test_Channel:
         call_args = channel._js.add_consumer.call_args
         consumer_cfg = call_args[0][1]
         assert consumer_cfg.durable_name == 'myapp_myqueue'
+
+    def test_ensure_consumer_sanitizes_dotted_queue_names(self, channel):
+        channel._js.add_consumer = AsyncMock()
+        channel._ensure_consumer('reply.celery.pidbox')
+        call_args = channel._js.add_consumer.call_args
+        consumer_cfg = call_args[0][1]
+        assert consumer_cfg.durable_name.startswith('CONSUMER_reply_celery_pidbox__')
+        assert '.' not in consumer_cfg.durable_name
 
     # -- _ensure_stream --------------------------------------------------
 
