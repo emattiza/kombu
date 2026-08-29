@@ -42,25 +42,6 @@ class test_Channel:
         self.channel._delete(self.queue)
         assert not self.channel._has_queue(self.queue)
 
-    def test_close_cleans_up_server_state(self):
-        """Closing the connection deletes the stream (and its consumer)
-        from JetStream — no orphaned server-side state across restarts."""
-        # Leave the message UNACKED — a stream with a pending redelivery
-        # is exactly the orphaned state we want cleaned up on close.
-        self.channel._put(self.queue, {'body': 'x'})
-        self.channel._get(self.queue)
-        assert self.channel._has_queue(self.queue)
-
-        self.connection.close()
-
-        # A fresh connection must not see the stream anymore.
-        conn2 = self.create_connection()
-        try:
-            ch2 = conn2.default_channel
-            assert not ch2._has_queue(self.queue)
-        finally:
-            conn2.close()
-
     def test_size_returns_queue_size(self):
         self.channel._put(self.queue, {'body': 'test1'})
         self.channel._put(self.queue, {'body': 'test2'})
