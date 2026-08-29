@@ -449,6 +449,7 @@ class Channel(virtual.Channel):
                     password=self.conninfo.password,
                     connect_timeout=self.connection_wait_time_seconds,
                     error_cb=self._on_nats_error,
+                    reconnected_cb=self._on_reconnect,
                 )
             )
         return self._nats_client
@@ -521,6 +522,11 @@ class Channel(virtual.Channel):
         """
         return self.options.get('nats_metadata_header_names', None)
 
+    async def _on_reconnect(self) -> None:
+        """Called by nats-py after a reconnect — cached subscriptions are invalid."""
+        logger.info("NATS reconnected, clearing pull subscription cache")
+        self._subscriptions.clear()
+
     async def _on_nats_error(self, exc: Exception) -> None:
         """Async error callback passed to nats-py on connect.
 
@@ -567,6 +573,8 @@ class JetStreamChannel(Channel):
     def __init__(self, *args, **kwargs):
         self._streams: set = set()
         self._js_consumers: set = set()
+        # Cache of pull subscriptions keyed by "{stream}:{consumer}"
+        self._subscriptions: dict[str, object] = {}
         # fanout: exchange_name -> asyncio.Queue (fanout inbox per queue)
         self._fanout_inboxes: dict[str, asyncio.Queue] = {}
         # fanout: exchange_name -> nats subscription
@@ -825,14 +833,22 @@ class JetStreamChannel(Channel):
         if self._js is None:
             raise RuntimeError("JetStream context not initialized")
 
+        stream_name = self._get_stream_name(queue)
+        consumer_name = self._get_consumer_name(queue)
+        sub_key = f"{stream_name}:{consumer_name}"
+
         try:
-            pull_sub = self._run(
-                self._js.pull_subscribe(
-                    queue,
-                    self._get_consumer_name(queue),
-                    stream=self._get_stream_name(queue),
+            # Cache the pull subscription: creating a new one on every
+            # _get() call adds a JetStream API round trip per message.
+            if sub_key not in self._subscriptions:
+                self._subscriptions[sub_key] = self._run(
+                    self._js.pull_subscribe(
+                        queue,
+                        consumer_name,
+                        stream=stream_name,
+                    )
                 )
-            )
+            pull_sub = self._subscriptions[sub_key]
             msg = self._run(
                 pull_sub.fetch(1, timeout=self.wait_time_seconds)
             )[0]
@@ -858,6 +874,11 @@ class JetStreamChannel(Channel):
             raise RuntimeError("JetStream context not initialized")
 
         stream_name = self._get_stream_name(queue)
+        consumer_name = self._get_consumer_name(queue)
+
+        # Clear cached pull subscription for this stream/consumer.
+        self._subscriptions.pop(f"{stream_name}:{consumer_name}", None)
+
         try:
             self._run(self._js.delete_stream(stream_name))
         except nats.js.errors.NotFoundError:
