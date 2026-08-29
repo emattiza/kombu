@@ -20,6 +20,7 @@ nats = pytest.importorskip('nats')
 import nats.errors  # noqa: E402
 import nats.js.errors  # noqa: E402
 
+from kombu.exceptions import NotBoundError
 from kombu.transport.nats import DEFAULT_HOST  # noqa: E402
 from kombu.transport.nats import DEFAULT_METADATA_HEADER_NAMES  # noqa: E402
 from kombu.transport.nats import (DEFAULT_PORT, Channel, JetStreamChannel,  # noqa: E402
@@ -628,9 +629,21 @@ class test_Channel:
         channel.connection = mock_connection
         assert channel.options == {'foo': 'bar'}
 
+    def test_options_raises_when_closed(self, channel, mock_connection):
+        channel.connection = mock_connection
+        channel.closed = True
+        with pytest.raises(NotBoundError, match='Channel is closed'):
+            _ = channel.options
+
     def test_conninfo_returns_client(self, channel, mock_connection):
         channel.connection = mock_connection
         assert channel.conninfo is mock_connection.client
+
+    def test_conninfo_raises_when_closed(self, channel, mock_connection):
+        channel.connection = mock_connection
+        channel.closed = True
+        with pytest.raises(NotBoundError, match='Channel is closed'):
+            _ = channel.conninfo
 
     def test_wait_time_seconds_default(self, channel):
         # Delete cached value so the property is recalculated.
