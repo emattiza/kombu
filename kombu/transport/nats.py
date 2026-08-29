@@ -389,35 +389,26 @@ class Channel(virtual.Channel):
     default_wait_time_seconds = 5
     default_connection_wait_time_seconds = 5
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, connection, *args, transport=None, **kwargs):
         if Client is None:
             raise ImportError("nats-py is not installed")
+        # The transport owns the shared NATS client + event loop.  In
+        # production it is always passed by ``Transport.create_channel``;
+        # the fallbacks cover direct construction (tests, Kombu internals).
+        self.transport = transport or getattr(connection, 'transport', None)\
+            or connection
 
-        super().__init__(*args, **kwargs)
+        super().__init__(connection, *args, **kwargs)
 
         port = self.connection.client.port or self.connection.default_port
         host = self.connection.client.hostname or DEFAULT_HOST
-
         logger.debug("Host: %s Port: %s", host, port)
 
-        # Each channel owns its own private asyncio event loop running in a
-        # dedicated background thread.  This prevents re-entrancy errors when
-        # Celery (or any other caller) tries to ack/nak a message from a
-        # callback that executes while the loop is already running (e.g.
-        # task_acks_late=True + retries).  Using run_coroutine_threadsafe
-        # instead of run_until_complete makes _run safe from any thread.
-        self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._loop.run_forever,
-            daemon=True,
-            name=f"kombu-nats-{id(self)}",
-        )
-        self._loop_thread.start()
+        # Borrow the shared event loop from the transport
+        self._loop = self.transport._get_loop()
+        self._nats_client = None
+        self._js = None
 
-        self._nats_client: Client | None = None
-        self._js: JetStreamContext | None = None
-
-        # Evaluate connection
         self.client
 
     def _run(self, coro):
@@ -434,24 +425,9 @@ class Channel(virtual.Channel):
         return future.result()
 
     def _open(self):
-        """Open a new connection to NATS."""
-        if self._nats_client is None:
-            self._nats_client = Client()
-            if self._nats_client is None:
-                raise RuntimeError("Failed to create NATS client")
-
-            host = self.conninfo.hostname or DEFAULT_HOST
-            port = self.conninfo.port or DEFAULT_PORT
-            self._run(
-                self._nats_client.connect(
-                    f"nats://{host}:{port}",
-                    user=self.conninfo.userid,
-                    password=self.conninfo.password,
-                    connect_timeout=self.connection_wait_time_seconds,
-                    error_cb=self._on_nats_error,
-                    reconnected_cb=self._on_reconnect,
-                )
-            )
+        """Open a connection to NATS (shared across channels)."""
+        self._nats_client = self.transport._get_client(
+            self.conninfo, connect_timeout=self.connection_wait_time_seconds)
         return self._nats_client
 
     @cached_property
@@ -522,39 +498,17 @@ class Channel(virtual.Channel):
         """
         return self.options.get('nats_metadata_header_names', None)
 
-    async def _on_reconnect(self) -> None:
-        """Called by nats-py after a reconnect — cached subscriptions are invalid."""
-        logger.info("NATS reconnected, clearing pull subscription cache")
-        self._subscriptions.clear()
-
-    async def _on_nats_error(self, exc: Exception) -> None:
-        """Async error callback passed to nats-py on connect.
-
-        Drain-timeout errors during ``Channel.close()`` are expected and
-        handled in Python; suppress the default nats-py stderr print for
-        them.  All other errors are forwarded to the Kombu logger.
-        """
-        if isinstance(exc, nats.errors.DrainTimeoutError):
-            logger.debug("NATS drain timed out (suppressed): %s", exc)
-        else:
-            logger.warning("NATS error: %s", exc)
-
     def close(self):
-        """Close the channel, draining the NATS client then stopping the event loop thread."""
-        if self._nats_client is not None:
-            try:
-                try:
-                    self._run(self._nats_client.drain())
-                except nats.errors.DrainTimeoutError:
-                    logger.debug("NATS drain timed out during channel close; closing anyway")
-                self._run(self._nats_client.close())
-            finally:
-                self._nats_client = None
-                self._js = None
-        if not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._loop_thread.join(timeout=5)
-            self._loop.close()
+        """Close the channel (local cleanup only).
+
+        The NATS client and event loop are shared with other channels of
+        this transport, so they are *not* torn down here.  The Transport
+        drains/closes the client and stops the loop in
+        ``Transport.close_connection()`` once every channel is closed.
+        """
+        self._nats_client = None
+        self._js = None
+        super().close()
 
 
 class JetStreamChannel(Channel):
@@ -1106,6 +1060,83 @@ class Transport(virtual.Transport):
         if Client is None:
             raise ImportError("nats-py is not installed")
         super().__init__(client, **kwargs)
+        # State shared by all channels of this transport: one NATS
+        # client (TCP connection) and one event-loop thread.
+        self._nats_client = None
+        self._loop = None
+        self._loop_thread = None
+        self._loop_lock = threading.Lock()
+
+    def _get_loop(self):
+        """Return (and lazily create) the shared event loop thread."""
+        with self._loop_lock:
+            if self._loop is None or self._loop.is_closed():
+                self._loop = asyncio.new_event_loop()
+                self._loop_thread = threading.Thread(
+                    target=self._loop.run_forever,
+                    daemon=True,
+                    name="kombu-nats-loop",
+                )
+                self._loop_thread.start()
+            return self._loop
+
+    def _run_on_loop(self, coro):
+        """Submit *coro* to the shared event loop and block until done."""
+        if self._loop is None or self._loop.is_closed():
+            raise RuntimeError("NATS event loop is closed")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def _get_client(self, conninfo, connect_timeout=None):
+        """Return (and lazily create) the shared NATS client.
+
+        Only the first channel to call this actually dials NATS; later
+        channels reuse the same TCP connection.
+        """
+        if self._nats_client is None:
+            self._nats_client = Client()
+            if self._nats_client is None:
+                raise RuntimeError("Failed to create NATS client")
+
+            host = conninfo.hostname or DEFAULT_HOST
+            port = conninfo.port or DEFAULT_PORT
+            if connect_timeout is None:
+                connect_timeout = \
+                    conninfo.transport_options.get(
+                        "connection_wait_time_seconds", 5)
+            self._run_on_loop(
+                self._nats_client.connect(
+                    f"nats://{host}:{port}",
+                    user=conninfo.userid,
+                    password=conninfo.password,
+                    connect_timeout=connect_timeout,
+                    error_cb=self._on_nats_error,
+                    reconnected_cb=self._on_reconnect,
+                )
+            )
+        return self._nats_client
+
+    async def _on_reconnect(self) -> None:
+        """Called by nats-py after a reconnect — all cached pull
+        subscriptions are stale and must be dropped."""
+        logger.info("NATS reconnected, clearing pull subscription caches")
+        for channel in self.channels:
+            try:
+                channel._subscriptions.clear()
+            except AttributeError:
+                pass
+
+    async def _on_nats_error(self, exc: Exception) -> None:
+        """Async error callback passed to nats-py on connect.
+
+        Drain-timeout errors during transport shutdown are expected and
+        handled in Python; suppress the default nats-py stderr print for
+        them.  All other errors are forwarded to the Kombu logger.
+        """
+        if isinstance(exc, nats.errors.DrainTimeoutError):
+            logger.debug("NATS drain timed out (suppressed): %s", exc)
+        else:
+            logger.warning("NATS error: %s", exc)
 
     def _channel_cls_for(self, connection) -> type:
         """Return the channel class appropriate for *connection*'s URL scheme.
@@ -1119,11 +1150,12 @@ class Transport(virtual.Transport):
         return JetStreamChannel
 
     def create_channel(self, connection):
+
         """Create a channel whose type is selected by the URL scheme."""
         try:
             return self._avail_channels.pop()
         except IndexError:
-            channel = self._channel_cls_for(connection)(connection)
+            channel = self._channel_cls_for(connection)(connection, transport=self)
             self.channels.append(channel)
             return channel
 
@@ -1139,8 +1171,30 @@ class Transport(virtual.Transport):
         return super().establish_connection()
 
     def close_connection(self, connection):
-        """Close the connection to NATS."""
-        return super().close_connection(connection)
+        """Close the connection: close all channels, drain the shared NATS
+        client, then stop the shared event loop thread."""
+        super().close_connection(connection)
+
+        # Drain + close the shared client while the loop is still running.
+        if self._nats_client is not None:
+            try:
+                try:
+                    self._run_on_loop(self._nats_client.drain())
+                except nats.errors.DrainTimeoutError:
+                    logger.debug(
+                        "NATS drain timed out during close; closing anyway")
+                self._run_on_loop(self._nats_client.close())
+            finally:
+                self._nats_client = None
+
+        # Now stop the shared loop.
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._loop_thread is not None:
+                self._loop_thread.join(timeout=5)
+            self._loop.close()
+        self._loop = None
+        self._loop_thread = None
 
     def verify_connection(self, connection):
         """Verify the connection works."""
