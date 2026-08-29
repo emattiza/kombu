@@ -619,6 +619,16 @@ class JetStreamChannel(Channel):
         prefix = self.options.get("consumer_name_prefix", self.default_consumer_name_prefix)
         return normalize_js_resource_name(f"{prefix}{queue}")
 
+    def _register_stream(self, stream_name):
+        """Remember *stream_name* for server-side cleanup on close.
+
+        Tracked on both this channel (fast-path existence checks) and the
+        transport (survives ``Channel.close()``, which removes the channel
+        from ``transport.channels`` and drops its refs).
+        """
+        self._streams.add(stream_name)
+        self.transport._streams.add(stream_name)
+
     def _ensure_stream(self, queue):
         """Ensure a stream exists for the queue."""
         stream_name = self._get_stream_name(queue)
@@ -636,7 +646,7 @@ class JetStreamChannel(Channel):
                     timeout=1.0  # Use a shorter timeout for the check
                 )
             )
-            self._streams.add(stream_name)
+            self._register_stream(stream_name)
             return
         except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
             # Stream doesn't exist or timed out, we'll create it
@@ -670,7 +680,7 @@ class JetStreamChannel(Channel):
                     timeout=5.0  # Use a longer timeout for creation
                 )
             )
-            self._streams.add(stream_name)
+            self._register_stream(stream_name)
         except nats.errors.TimeoutError:
             # If we timeout creating the stream, check if it was actually created
             try:
@@ -680,7 +690,7 @@ class JetStreamChannel(Channel):
                         timeout=1.0
                     )
                 )
-                self._streams.add(stream_name)
+                self._register_stream(stream_name)
             except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
                 raise RuntimeError(f"Failed to create stream {stream_name}")
 
@@ -1061,11 +1071,13 @@ class Transport(virtual.Transport):
             raise ImportError("nats-py is not installed")
         super().__init__(client, **kwargs)
         # State shared by all channels of this transport: one NATS
-        # client (TCP connection) and one event-loop thread.
+        # client (TCP connection), one event-loop thread, and the set of
+        # JetStream stream names this connection created (for cleanup).
         self._nats_client = None
         self._loop = None
         self._loop_thread = None
         self._loop_lock = threading.Lock()
+        self._streams: set[str] = set()
 
     def _get_loop(self):
         """Return (and lazily create) the shared event loop thread."""
@@ -1171,12 +1183,39 @@ class Transport(virtual.Transport):
         return super().establish_connection()
 
     def close_connection(self, connection):
-        """Close the connection: close all channels, drain the shared NATS
-        client, then stop the shared event loop thread."""
+        """Close the connection: delete JetStream resources created by our
+        channels, close all channels, drain the shared NATS client, then
+        stop the shared event loop thread.
+
+        Streams (and their consumers) created by this transport are removed
+        from the server so they do not pile up in JetStream across worker
+        restarts.  A crashed worker never reaches here, so its durable
+        consumers survive and messages get redelivered — exactly the
+        at-least-once contract.
+        """
+        # Collect the streams created by this transport BEFORE the channels
+        # close (Channel.close() removes channels from self.channels and
+        # drops their refs).  Deleting a NATS stream also deletes all of
+        # its consumers, so one pass covers both server-side resources.
+        streams = set(self._streams)
+
         super().close_connection(connection)
 
         # Drain + close the shared client while the loop is still running.
         if self._nats_client is not None:
+            # Delete leftover JetStream state before tearing down the wire
+            # connection.
+            if streams:
+                js = self._nats_client.jetstream()
+                for stream_name in streams:
+                    try:
+                        self._run_on_loop(js.delete_stream(stream_name))
+                    except nats.js.errors.NotFoundError:
+                        pass  # already gone — fine
+                    except Exception:
+                        logger.warning(
+                            "Failed to delete NATS stream %r during close",
+                            stream_name, exc_info=True)
             try:
                 try:
                     self._run_on_loop(self._nats_client.drain())
@@ -1186,6 +1225,7 @@ class Transport(virtual.Transport):
                 self._run_on_loop(self._nats_client.close())
             finally:
                 self._nats_client = None
+                self._streams.clear()
 
         # Now stop the shared loop.
         if self._loop is not None and not self._loop.is_closed():

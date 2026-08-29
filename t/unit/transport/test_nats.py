@@ -54,6 +54,7 @@ class _FakeTransport:
         )
         self._loop_thread.start()
         self._nats_client = None
+        self._streams = set()
 
     def _get_loop(self):
         return self._loop
@@ -903,6 +904,61 @@ class test_Transport:
         assert transport._nats_client is None
         assert transport._loop is None
         assert transport._loop_thread is None
+
+    def test_close_connection_deletes_channel_streams(self):
+        """Streams registered on the transport are deleted from JetStream
+        on close, so they don't accumulate server-side across restarts."""
+        transport = Transport(self.mock_client)
+        transport._get_loop()
+        mock_nc = MagicMock()
+        mock_nc.drain = AsyncMock()
+        mock_nc.close = AsyncMock()
+        js = MagicMock()
+        js.delete_stream = AsyncMock()
+        mock_nc.jetstream.return_value = js
+        transport._nats_client = mock_nc
+        transport._streams = {'STREAM_a', 'STREAM_b', 'STREAM_c'}
+
+        transport.close_connection(None)
+
+        deleted = {c.args[0] for c in js.delete_stream.await_args_list}
+        assert deleted == {'STREAM_a', 'STREAM_b', 'STREAM_c'}
+        mock_nc.drain.assert_awaited_once()
+        mock_nc.close.assert_awaited_once()
+        assert transport._streams == set()
+
+    def test_close_connection_ignores_consumer_state_channels(self):
+        """Transport-level stream registry needs no channel introspection."""
+        transport = Transport(self.mock_client)
+        transport._get_loop()
+        mock_nc = MagicMock()
+        mock_nc.drain = AsyncMock()
+        mock_nc.close = AsyncMock()
+        transport._nats_client = mock_nc
+
+        # No streams registered (e.g. Core NATS-only usage).
+        transport.close_connection(None)
+        assert transport._nats_client is None
+
+    def test_close_connection_deletes_streams_before_client_drain(self):
+        """Deletes happen while the connection is alive, before drain."""
+        transport = Transport(self.mock_client)
+        transport._get_loop()
+        mock_nc = MagicMock()
+        mock_nc.drain = AsyncMock()
+        mock_nc.close = AsyncMock()
+        js = MagicMock()
+        js.delete_stream = AsyncMock()
+        mock_nc.jetstream.return_value = js
+        transport._nats_client = mock_nc
+
+        transport._streams = {'STREAM_a'}
+        transport.close_connection(None)
+
+        # The delete must be awaited before drain.
+        js.delete_stream.assert_awaited()
+        assert js.delete_stream.await_args_list[0].args[0] == 'STREAM_a'
+        assert mock_nc.drain.await_count == 1
 
 
 # ---------------------------------------------------------------------------
