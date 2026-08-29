@@ -69,11 +69,21 @@ import hashlib
 import threading
 from queue import Empty
 
-from kombu.exceptions import NotBoundError
+from kombu.exceptions import NotBoundError, OperationalError
 from kombu.transport import virtual
 from kombu.utils import cached_property
 from kombu.utils.encoding import str_to_bytes
 from kombu.utils.json import dumps, loads
+
+
+class NATSError(OperationalError):
+    """NATS transport operational error — a recoverable transport failure.
+
+    Subclasses :class:`~kombu.exceptions.OperationalError` (which in turn
+    subclasses :class:`~kombu.exceptions.KombuError`), so Celery/robust retry
+    machinery treats it as retryable and operators can catch NATS-specific
+    failures distinctly.
+    """
 
 try:
     import nats.aio.client
@@ -724,8 +734,9 @@ class JetStreamChannel(Channel):
                     )
                 )
                 self._streams.add(stream_name)
-            except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
-                raise RuntimeError(f"Failed to create stream {stream_name}")
+            except (nats.js.errors.NotFoundError, nats.errors.TimeoutError) as exc:
+                raise NATSError(
+                    f"Failed to create stream {stream_name}") from exc
 
     def _ensure_consumer(self, queue):
         """Ensure a consumer exists for the queue."""
@@ -766,8 +777,10 @@ class JetStreamChannel(Channel):
                     )
                 )
                 self._js_consumers.add(consumer_name)
-            except (nats.js.errors.NotFoundError, nats.errors.TimeoutError):
-                raise RuntimeError(f"Failed to create consumer {consumer_name} for stream {name}")
+            except (nats.js.errors.NotFoundError, nats.errors.TimeoutError) as exc:
+                raise NATSError(
+                    f"Failed to create consumer {consumer_name} for stream {name}"
+                ) from exc
 
     def _put(self, queue, message, **kwargs):
         """Put a message on a queue."""

@@ -19,12 +19,13 @@ nats = pytest.importorskip('nats')
 import nats.errors  # noqa: E402
 import nats.js.errors  # noqa: E402
 
-from kombu.exceptions import NotBoundError
+from kombu.exceptions import NotBoundError, OperationalError
 from kombu.transport.nats import DEFAULT_HOST  # noqa: E402
 from kombu.transport.nats import DEFAULT_METADATA_HEADER_NAMES  # noqa: E402
 from kombu.transport.nats import (DEFAULT_PORT, Channel, JetStreamChannel,  # noqa: E402
                                   MAX_INBOX_SIZE, Message, QoS, Transport,
-                                  CoreNATSChannel, decode_nats_header_value,
+                                  CoreNATSChannel, NATSError,
+                                  decode_nats_header_value,
                                   encode_nats_header_value,
                                   message_to_nats_body_and_headers,
                                   nats_body_and_headers_to_message,
@@ -416,6 +417,31 @@ class test_Channel:
         channel._js = None
         with pytest.raises(RuntimeError, match='JetStream context not initialized'):
             channel._ensure_consumer('myqueue')
+
+    def test_ensure_stream_raises_nats_error_with_cause(self, channel):
+        """Creation fails: stream_info NotFound + add_stream Timeout →
+        NATSError chaining the original cause."""
+        channel._js.stream_info = AsyncMock(side_effect=_NotFoundError())
+        channel._js.add_stream = AsyncMock(side_effect=_NatsTimeoutError())
+        channel._js.stream_info = AsyncMock(side_effect=_NotFoundError())
+
+        with pytest.raises(NATSError) as excinfo:
+            channel._ensure_stream('myqueue')
+        assert 'STREAM_myqueue' in str(excinfo.value)
+        # Cause must be chained, not swallowed.
+        assert isinstance(excinfo.value.__cause__, _NotFoundError)
+        assert isinstance(excinfo.value, OperationalError)
+
+    def test_ensure_consumer_raises_nats_error_with_cause(self, channel):
+        """Consumer creation times out and the check also fails →
+        NATSError chaining the original cause."""
+        channel._js.add_consumer = AsyncMock(side_effect=_NatsTimeoutError())
+        channel._js.consumer_info = AsyncMock(side_effect=_NotFoundError())
+
+        with pytest.raises(NATSError) as excinfo:
+            channel._ensure_consumer('myqueue')
+        assert 'CONSUMER_myqueue' in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, _NotFoundError)
 
     # -- _put ------------------------------------------------------------
 
