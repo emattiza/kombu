@@ -69,6 +69,7 @@ import hashlib
 import threading
 from queue import Empty
 
+from kombu.exceptions import NotBoundError
 from kombu.transport import virtual
 from kombu.utils import cached_property
 from kombu.utils.encoding import str_to_bytes
@@ -461,11 +462,15 @@ class Channel(virtual.Channel):
     @property
     def options(self):
         """Get the transport options."""
+        if self.closed:
+            raise NotBoundError("Channel is closed")
         return self.connection.client.transport_options
 
     @property
     def conninfo(self):
         """Get the connection info."""
+        if self.closed:
+            raise NotBoundError("Channel is closed")
         return self.connection.client
 
     @cached_property
